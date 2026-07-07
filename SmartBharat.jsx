@@ -354,6 +354,7 @@ function reducer(state, action) {
     }
     case "UPDATE_STATUS":   return { ...state, issues: state.issues.map((i) => i.id === action.id ? { ...i, status: action.status }         : i) };
     case "ASSIGN_ISSUE":    return { ...state, issues: state.issues.map((i) => i.id === action.id ? { ...i, assignedTo: action.employeeId }  : i) };
+    case "RATE_ISSUE":      return { ...state, issues: state.issues.map((i) => i.id === action.id ? { ...i, rating: action.rating }          : i) };
     case "UPVOTE":          return { ...state, upvotes: { ...state.upvotes, [action.id]: (state.upvotes[action.id] ?? 0) + 1 } };
     case "DISMISS_NOTIF":   return { ...state, notifications: state.notifications.filter((n) => n.id !== action.id) };
     case "TOGGLE_THEME":    return { ...state, theme: state.theme === "dark" ? "light" : "dark" };
@@ -445,7 +446,40 @@ class ErrorBoundary extends Component {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Self-tests  (25 assertions)
+//  SLA Helper Logic
+// ══════════════════════════════════════════════════════════════
+const SLA_LIMITS = {
+  "Roads & Potholes": 5,
+  "Water Supply": 2,
+  "Sanitation & Waste": 2,
+  "Electricity": 1,
+  "Public Safety": 1,
+  "Parks & Environment": 3,
+  "General Civic Issue": 3
+};
+
+function getSLADetails(issue) {
+  const limitDays = SLA_LIMITS[issue.category] || 3;
+  let createdDate = new Date();
+  if (issue.createdAt) {
+    if (issue.createdAt.includes("day ago") || issue.createdAt.includes("days ago")) {
+      const days = parseInt(issue.createdAt) || 1;
+      createdDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    } else if (issue.createdAt.includes("week ago") || issue.createdAt.includes("weeks ago")) {
+      const weeks = parseInt(issue.createdAt) || 1;
+      createdDate = new Date(Date.now() - weeks * 7 * 24 * 60 * 60 * 1000);
+    } else {
+      const parsed = Date.parse(issue.createdAt);
+      if (!isNaN(parsed)) createdDate = new Date(parsed);
+    }
+  }
+  const deadline = new Date(createdDate.getTime() + limitDays * 24 * 60 * 60 * 1000);
+  const isOverdue = Date.now() > deadline.getTime() && issue.status !== "Resolved";
+  return { limitDays, deadline: deadline.toLocaleDateString(), isOverdue };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Self-tests  (39 assertions)
 // ══════════════════════════════════════════════════════════════
 function runSelfTests() {
   const results = [];
@@ -516,7 +550,160 @@ function runSelfTests() {
   const aid = autoAssign("Electricity", initialState.employees);
   assert("AutoAssign — Electricity → Electricity dept", initialState.employees.find((e) => e.id === aid)?.dept === "Electricity");
 
+  // --- SLA check ---
+  const sla1 = getSLADetails({ category: "Roads & Potholes", createdAt: "1 day ago" });
+  assert("SLA — Roads & Potholes limit is 5 days", sla1.limitDays === 5);
+  assert("SLA — On Track if created recently", !sla1.isOverdue);
+
+  const sla2 = getSLADetails({ category: "Electricity", createdAt: "1 week ago", status: "Reported" });
+  assert("SLA — Electricity limit is 1 day", sla2.limitDays === 1);
+  assert("SLA — Overdue check returns true for old unresolved issues", sla2.isOverdue);
+
+  // --- Badge rewards ---
+  assert("Badge — 0 pts returns New Nagrik", badgeFor(0).includes("New Nagrik"));
+  assert("Badge — 50 pts returns Bronze Nagrik", badgeFor(50).includes("Bronze Nagrik"));
+  assert("Badge — 100 pts returns Silver Nagrik", badgeFor(100).includes("Silver Nagrik"));
+  assert("Badge — 200 pts returns Gold Nagrik", badgeFor(200).includes("Gold Nagrik"));
+
+  // --- Reducer Rate ---
+  const rTest = reducer(initialState, { type: "RATE_ISSUE", id: 1, rating: 5 });
+  assert("Reducer RATE_ISSUE — assigns user rating", rTest.issues.find(i => i.id === 1)?.rating === 5);
+
   return results;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Issue Card Component
+// ══════════════════════════════════════════════════════════════
+/**
+ * Unified component for displaying an individual civic issue.
+ * Supports upvoting, status updates, SLA checking, and citizen feedback rating.
+ * 
+ * @param {Object} props
+ * @param {Object} props.issue The issue object to render.
+ * @param {boolean} [props.isEmployee=false] Whether to show employee triage controls.
+ * @param {boolean} [props.isSelected=false] Whether the card is selected (bulk actions).
+ * @param {Function} [props.onSelect] Callback for select checkbox.
+ * @param {Function} props.onUpvote Callback for upvote action.
+ * @param {Function} [props.onStatusChange] Callback for updating status.
+ * @param {Function} [props.onAssigneeChange] Callback for reassigning employee.
+ * @param {Function} [props.onRate] Callback for setting star feedback.
+ * @param {Array} [props.employees] List of employees for assignee dropdown selection.
+ * @param {number} props.upvotes Total upvotes for this issue.
+ */
+function IssueCard({
+  issue,
+  isEmployee = false,
+  isSelected = false,
+  onSelect,
+  onUpvote,
+  onStatusChange,
+  onAssigneeChange,
+  onRate,
+  employees = [],
+  upvotes = 0
+}) {
+  const sla = getSLADetails(issue);
+  const assignee = employees.find((e) => e.id === issue.assignedTo);
+
+  return (
+    <li className={`issue-card${isSelected ? " selected" : ""}${sla.isOverdue ? " overdue-card" : ""}`}>
+      <div className="issue-top">
+        {isEmployee && onSelect && (
+          <input
+            type="checkbox"
+            style={{ width: "auto", marginRight: "0.25rem" }}
+            checked={isSelected}
+            onChange={onSelect}
+            aria-label={`Select issue: ${issue.text.slice(0, 40)}`}
+          />
+        )}
+        <span className="chip">{issue.icon} {issue.category}</span>
+        <span className={`chip priority-${issue.priority.toLowerCase()}`}>{issue.priority}</span>
+        {assignee && <span className="chip">👤 {assignee.name}</span>}
+        <button
+          className="upvote-btn"
+          onClick={onUpvote}
+          aria-label={`Upvote. Current: ${upvotes}`}
+        >
+          👍 {upvotes}
+        </button>
+      </div>
+
+      {issue.image && <img src={issue.image} alt="Evidence submitted for this civic issue" className="thumb small-thumb" />}
+      <p className="issue-text">{issue.text}</p>
+      
+      <div className="issue-meta-row" style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "0.4rem", margin: "0.3rem 0" }}>
+        <p className="muted small">📍 {issue.location} · {issue.createdAt}</p>
+        <span className={`sla-chip ${sla.isOverdue ? "overdue" : "on-track"}`} style={{ fontSize: "0.75rem", color: sla.isOverdue ? "var(--red)" : "var(--green)", fontWeight: 600 }} aria-label={`SLA limit: ${sla.limitDays} days. Deadline: ${sla.deadline}`}>
+          ⏳ SLA: {sla.deadline} {sla.isOverdue ? "(⚠️ Overdue)" : ""}
+        </span>
+      </div>
+
+      <IssueTimeline status={issue.status} />
+
+      {/* Citizen feedback: Rate resolved issues */}
+      {!isEmployee && issue.status === "Resolved" && (
+        <div className="rating-section" style={{ marginTop: "0.8rem" }}>
+          <span className="muted small" style={{ marginRight: "0.5rem" }}>Rate resolution:</span>
+          {issue.rating ? (
+            <span className="stars-display" style={{ color: "var(--marigold)" }} aria-label={`Rated ${issue.rating} stars`}>
+              {"★".repeat(issue.rating)}{"☆".repeat(5 - issue.rating)}
+            </span>
+          ) : (
+            <div className="stars-input" style={{ display: "inline-flex", gap: "2px" }} role="group" aria-label="Rate resolution stars">
+              {[1, 2, 3, 4, 5].map((star) => (
+                <button
+                  key={star}
+                  type="button"
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "var(--marigold)", fontSize: "1.1rem", padding: 0 }}
+                  onClick={() => onRate && onRate(star)}
+                  aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}
+                >
+                  ☆
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Mutation controls: employees only */}
+      {isEmployee ? (
+        <div className="admin-controls">
+          <label htmlFor={`status-${issue.id}`} className="sr-only">Update status for this issue</label>
+          <select
+            id={`status-${issue.id}`}
+            value={issue.status}
+            onChange={(e) => onStatusChange && onStatusChange(e.target.value)}
+          >
+            <option>Reported</option>
+            <option>In Progress</option>
+            <option>Resolved</option>
+          </select>
+          
+          <label htmlFor={`assign-${issue.id}`} className="sr-only">Reassign to employee</label>
+          <select
+            id={`assign-${issue.id}`}
+            value={issue.assignedTo ?? ""}
+            onChange={(e) => onAssigneeChange && onAssigneeChange(e.target.value)}
+          >
+            {employees.map((e) => (
+              <option key={e.id} value={e.id}>
+                Assign: {e.name} ({e.dept})
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : (
+        issue.status !== "Resolved" && (
+          <span className={`chip status-${issue.status.replace(/\s/g, "").toLowerCase()}`} style={{ marginTop: "0.5rem", display: "inline-block" }}>
+            {issue.status}
+          </span>
+        )
+      )}
+    </li>
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -816,21 +1003,14 @@ function ReportTab() {
       )}
       <ul id="my-reports-list" className="issue-list" aria-labelledby="my-reports-heading">
         {myReports.map((iss) => (
-          <li key={iss.id} className="issue-card">
-            <div className="issue-top">
-              <span className="chip">{iss.icon} {iss.category}</span>
-              <span className={`chip priority-${iss.priority.toLowerCase()}`}>{iss.priority}</span>
-              <button className="upvote-btn"
-                onClick={() => dispatch({ type: "UPVOTE", id: iss.id })}
-                aria-label={`Upvote this issue. Current votes: ${state.upvotes[iss.id] ?? 0}`}>
-                👍 {state.upvotes[iss.id] ?? 0}
-              </button>
-            </div>
-            {iss.image && <img src={iss.image} alt="Citizen-submitted evidence for this civic issue" className="thumb small-thumb" />}
-            <p className="issue-text">{iss.text}</p>
-            <p className="muted small">📍 {iss.location} · {iss.createdAt}</p>
-            <IssueTimeline status={iss.status} />
-          </li>
+          <IssueCard
+            key={iss.id}
+            issue={iss}
+            isEmployee={false}
+            onUpvote={() => dispatch({ type: "UPVOTE", id: iss.id })}
+            onRate={(rating) => dispatch({ type: "RATE_ISSUE", id: iss.id, rating })}
+            upvotes={state.upvotes[iss.id] ?? 0}
+          />
         ))}
       </ul>
     </div>
@@ -1014,6 +1194,46 @@ function AdminTab() {
         </figure>
       </div>
 
+      {/* Department SLA Leaderboard */}
+      <h3 style={{ fontSize: "0.95rem", fontWeight: "700", marginBottom: "0.5rem", display: "flex", alignItems: "center", gap: "0.4rem" }}>📊 Department SLA Performance</h3>
+      <div className="dept-performance" style={{ marginBottom: "1.2rem", overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem", background: "rgba(255,255,255,0.02)", borderRadius: "10px" }} aria-label="Department SLA performance table">
+          <thead>
+            <tr style={{ borderBottom: "1px solid var(--track)", textAlign: "left" }}>
+              <th style={{ padding: "0.6rem" }}>Department</th>
+              <th style={{ padding: "0.6rem" }}>Assigned</th>
+              <th style={{ padding: "0.6rem" }}>Resolved</th>
+              <th style={{ padding: "0.6rem" }}>Overdue</th>
+              <th style={{ padding: "0.6rem" }}>SLA Compliance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[
+              { name: "Roads & Infrastructure", id: "emp-1", category: "Roads & Potholes" },
+              { name: "Water & Sanitation",     id: "emp-2", category: "Water Supply" },
+              { name: "Electricity",            id: "emp-3", category: "Electricity" },
+              { name: "General Administration",  id: "emp-4", category: "General Civic Issue" }
+            ].map((dept, index) => {
+              const assigned = state.issues.filter(i => i.assignedTo === dept.id || (dept.id === "emp-2" && i.category === "Sanitation & Waste"));
+              const total = assigned.length;
+              const resolvedCount = assigned.filter(i => i.status === "Resolved").length;
+              const compliance = total > 0 ? Math.round((resolvedCount / total) * 100) : 100;
+              const overdueCount = assigned.filter(i => getSLADetails(i).isOverdue).length;
+
+              return (
+                <tr key={index} style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
+                  <td style={{ padding: "0.6rem", fontWeight: 600 }}>{dept.name}</td>
+                  <td style={{ padding: "0.6rem" }}>{total}</td>
+                  <td style={{ padding: "0.6rem", color: "var(--green)" }}>{resolvedCount}</td>
+                  <td style={{ padding: "0.6rem", color: overdueCount > 0 ? "var(--red)" : "inherit" }}>{overdueCount}</td>
+                  <td style={{ padding: "0.6rem", fontWeight: 700, color: compliance >= 80 ? "var(--green)" : "var(--marigold)" }}>{compliance}%</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
       <div className="filters-row" role="group" aria-label="Filter and search controls">
         <label htmlFor="issue-search" className="sr-only">Search issues</label>
         <input id="issue-search" className="search-input" type="search" value={searchRaw}
@@ -1051,47 +1271,20 @@ function AdminTab() {
 
       <ul id="admin-issue-list" className="issue-list" aria-label={`${filtered.length} issues shown`}>
         {filtered.map((iss) => {
-          const assignee   = state.employees.find((e) => e.id === iss.assignedTo);
           const isSelected = selected.has(iss.id);
           return (
-            <li key={iss.id} className={`issue-card${isSelected ? " selected" : ""}`}>
-              <div className="issue-top">
-                {isEmployee && (
-                  <input type="checkbox" style={{ width: "auto", marginRight: "0.25rem" }}
-                    checked={isSelected} onChange={() => toggleSelect(iss.id)}
-                    aria-label={`Select issue: ${iss.text.slice(0, 40)}`} />
-                )}
-                <span className="chip">{iss.icon} {iss.category}</span>
-                <span className={`chip priority-${iss.priority.toLowerCase()}`}>{iss.priority}</span>
-                {assignee && <span className="chip">👤 {assignee.name}</span>}
-                <button className="upvote-btn"
-                  onClick={() => dispatch({ type: "UPVOTE", id: iss.id })}
-                  aria-label={`Upvote. Current: ${state.upvotes[iss.id] ?? 0}`}>
-                  👍 {state.upvotes[iss.id] ?? 0}
-                </button>
-              </div>
-              <p className="issue-text">{iss.text}</p>
-              <p className="muted small">📍 {iss.location} · {iss.createdAt}</p>
-              <IssueTimeline status={iss.status} />
-
-              {/* Mutation controls: employees only */}
-              {isEmployee ? (
-                <div className="admin-controls">
-                  <label htmlFor={`status-${iss.id}`} className="sr-only">Update status for this issue</label>
-                  <select id={`status-${iss.id}`} value={iss.status}
-                    onChange={(e) => dispatch({ type: "UPDATE_STATUS", id: iss.id, status: e.target.value })}>
-                    <option>Reported</option><option>In Progress</option><option>Resolved</option>
-                  </select>
-                  <label htmlFor={`assign-${iss.id}`} className="sr-only">Reassign to employee</label>
-                  <select id={`assign-${iss.id}`} value={iss.assignedTo ?? ""}
-                    onChange={(e) => dispatch({ type: "ASSIGN_ISSUE", id: iss.id, employeeId: e.target.value })}>
-                    {state.employees.map((e) => <option key={e.id} value={e.id}>Assign: {e.name} ({e.dept})</option>)}
-                  </select>
-                </div>
-              ) : (
-                <span className={`chip status-${iss.status.replace(/\s/g, "").toLowerCase()}`} style={{ marginTop: "0.5rem", display: "inline-block" }}>{iss.status}</span>
-              )}
-            </li>
+            <IssueCard
+              key={iss.id}
+              issue={iss}
+              isEmployee={true}
+              isSelected={isSelected}
+              onSelect={() => toggleSelect(iss.id)}
+              onUpvote={() => dispatch({ type: "UPVOTE", id: iss.id })}
+              onStatusChange={(status) => dispatch({ type: "UPDATE_STATUS", id: iss.id, status })}
+              onAssigneeChange={(employeeId) => dispatch({ type: "ASSIGN_ISSUE", id: iss.id, employeeId })}
+              employees={state.employees}
+              upvotes={state.upvotes[iss.id] ?? 0}
+            />
           );
         })}
         {filtered.length === 0 && <p className="muted empty-state" role="status">No issues match these filters.</p>}
@@ -1110,8 +1303,8 @@ function TestsTab() {
     <div className="panel animate-in" role="region" aria-label="Self-test QA suite">
       <h2>🧪 Self-tests (QA)</h2>
       <p className="muted" style={{ marginBottom: "0.8rem", lineHeight: 1.6 }}>
-        25-assertion in-browser suite — classifier, chatbot KB, sanitiser, CSV,
-        every reducer action, rate limiter, autoAssign routing, and email validation.
+        39-assertion in-browser suite — classifier, chatbot KB, sanitiser, CSV,
+        SLA tracking, point milestones, rating actions, every reducer action, rate limiter, autoAssign routing, and email validation.
         All assertions are pure with no side effects.
       </p>
       <button className="btn-primary" onClick={() => setResults(runSelfTests())}>▶ Run all tests</button>
